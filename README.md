@@ -53,7 +53,8 @@ By default, `redactHar` redacts:
 - the same sensitive parameters inside `request.url`;
 - sensitive fields in `request.postData.params`;
 - sensitive keys in JSON `request.postData.text`;
-- sensitive keys in `application/x-www-form-urlencoded` `request.postData.text`.
+- sensitive keys in `application/x-www-form-urlencoded` `request.postData.text`;
+- sensitive keys in JSON `response.content.text`.
 
 The report stores the path, rule, reason, and value lengths. It does not store the original value.
 
@@ -87,6 +88,8 @@ type HarRedactionResult =
 
 Expected invalid input returns `{ ok: false }` instead of throwing.
 
+`summary.changedEntries` counts HAR entries where at least one request or response value changed. `summary.changedRequests` is kept as a compatibility alias with the same value.
+
 ### `createHarRedactor(defaultOptions?)`
 
 ```ts
@@ -112,6 +115,18 @@ const byRule = summarizeHarRedactions(result.ok ? result.changes : []);
 ```
 
 Builds a per-rule count from a saved change list.
+
+### `isHarRedactionRule(rule)`
+
+```ts
+import { isHarRedactionRule } from "har-redaction-kit";
+
+if (isHarRedactionRule(configRule)) {
+  enabledRules.push(configRule);
+}
+```
+
+Validates user-provided rule names before passing them to `redactHar`.
 
 ### `harRedactionRules`
 
@@ -140,8 +155,18 @@ Exports the default key names used by query, form and JSON redaction.
 | `rules` | all built-in rules | Select which redaction rules run. |
 | `placeholder` | `[REDACTED]` | Replacement value written into the cloned HAR. |
 | `sensitiveKeys` | common token, secret, session and password names | Query, form and JSON key names to redact. |
+| `sensitiveKeyMatch` | `contains` | Use `contains` for broad matching or `exact` for stricter integrations. |
 | `maxRedactions` | unlimited | Stop changing values after this count. |
 | `keepOriginalUrl` | `false` | Keep `request.url` unchanged while still redacting `queryString`. |
+
+For strict tooling, use exact key matching to avoid broad matches such as `key` matching `monkey`:
+
+```ts
+redactHar(har, {
+  sensitiveKeys: ["token", "api_key", "session_id"],
+  sensitiveKeyMatch: "exact"
+});
+```
 
 ## Rules
 
@@ -152,6 +177,7 @@ type HarRedactionRule =
   | "cookies"
   | "query-sensitive-keys"
   | "post-data-sensitive-keys"
+  | "response-content-sensitive-keys"
   | "security-headers";
 ```
 
@@ -190,6 +216,7 @@ Use conservative defaults, review the `changes` report, and add project-specific
 - validate the full HAR schema;
 - render a HAR waterfall;
 - inspect every vendor-specific HAR extension;
+- decode and rewrite base64-encoded response bodies;
 - guarantee that all secrets are removed.
 
 The core is designed for browser workbenches, support tools and thin CLIs.

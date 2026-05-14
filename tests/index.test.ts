@@ -3,6 +3,7 @@ import {
   createHarRedactor,
   defaultHarSensitiveKeys,
   harRedactionRules,
+  isHarRedactionRule,
   redactHar,
   summarizeHarRedactions,
   type HarRedactionSuccess
@@ -144,7 +145,11 @@ describe("redactHar", () => {
                 { name: "Set-Cookie", value: "sid=response-secret; HttpOnly" },
                 { name: "Content-Type", value: "application/json" }
               ],
-              cookies: [{ name: "sid", value: "response-secret" }]
+              cookies: [{ name: "sid", value: "response-secret" }],
+              content: {
+                mimeType: "application/json",
+                text: JSON.stringify({ token: "response-body-secret", data: { ok: true } })
+              }
             }
           },
           {
@@ -167,6 +172,7 @@ describe("redactHar", () => {
           response?: {
             headers?: Array<{ value: string }>;
             cookies?: Array<{ value: string }>;
+            content?: { text: string };
           };
         }>;
       };
@@ -174,7 +180,38 @@ describe("redactHar", () => {
     expect(har.log.entries[0]!.response!.headers![0]!.value).toBe("[REDACTED]");
     expect(har.log.entries[0]!.response!.headers![1]!.value).toBe("application/json");
     expect(har.log.entries[0]!.response!.cookies![0]!.value).toBe("[REDACTED]");
+    expect(har.log.entries[0]!.response!.content!.text).toBe(
+      JSON.stringify({ token: "[REDACTED]", data: { ok: true } })
+    );
     expect(result.diagnostics).toEqual(["entry-without-response"]);
+  });
+
+  it("does not attempt to redact base64-encoded response content", () => {
+    const encoded = "eyJ0b2tlbiI6InJlc3BvbnNlLXNlY3JldCJ9";
+    const result = redactHar({
+      log: {
+        entries: [
+          {
+            request: { method: "GET", url: "https://example.test/", headers: [] },
+            response: {
+              content: {
+                mimeType: "application/json",
+                encoding: "base64",
+                text: encoded
+              }
+            }
+          }
+        ]
+      }
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected success");
+    const har = result.har as {
+      log: { entries: Array<{ response: { content: { text: string } } }> };
+    };
+    expect(har.log.entries[0]!.response.content.text).toBe(encoded);
+    expect(result.summary.byRule["response-content-sensitive-keys"]).toBe(0);
   });
 
   it("redacts form params, form-encoded text and non-string JSON secrets", () => {
@@ -203,7 +240,7 @@ describe("redactHar", () => {
               headers: [],
               postData: {
                 mimeType: "application/json",
-              text: JSON.stringify({ token: 123456, enabled: true, secret: { nested: "hidden" } })
+                text: JSON.stringify({ token: 123456, enabled: true, secret: { nested: "hidden" } })
               }
             }
           }
@@ -253,6 +290,44 @@ describe("redactHar", () => {
     if (!result.ok) throw new Error("expected success");
     expect(result.diagnostics).toContain("redaction-limit-reached");
     expect(result.summary.changes).toBe(2);
+    expect(result.summary.changedEntries).toBe(1);
+  });
+
+  it("can use exact sensitive key matching for stricter integrations", () => {
+    const result = redactHar(
+      {
+        log: {
+          entries: [
+            {
+              request: {
+                method: "GET",
+                url: "https://example.test/?monkey=public&key=secret",
+                headers: [],
+                queryString: [
+                  { name: "monkey", value: "public" },
+                  { name: "key", value: "secret" }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      {
+        rules: ["query-sensitive-keys"],
+        sensitiveKeys: ["key"],
+        sensitiveKeyMatch: "exact"
+      }
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected success");
+    const har = result.har as {
+      log: { entries: Array<{ request: { url: string; queryString: Array<{ value: string }> } }> };
+    };
+    expect(har.log.entries[0]!.request.queryString[0]!.value).toBe("public");
+    expect(har.log.entries[0]!.request.queryString[1]!.value).toBe("[REDACTED]");
+    expect(har.log.entries[0]!.request.url).toContain("monkey=public");
+    expect(har.log.entries[0]!.request.url).toContain("key=%5BREDACTED%5D");
   });
 
   it("creates a reusable redactor and summarizes changes", () => {
@@ -266,6 +341,8 @@ describe("redactHar", () => {
 
   it("exports built-in rules and default sensitive keys for UIs", () => {
     expect(harRedactionRules).toContain("post-data-sensitive-keys");
+    expect(isHarRedactionRule("response-content-sensitive-keys")).toBe(true);
+    expect(isHarRedactionRule("not-real")).toBe(false);
     expect(defaultHarSensitiveKeys).toContain("access_token");
   });
 });

@@ -13,12 +13,16 @@ export type HarRedactionRule =
   | "cookies"
   | "query-sensitive-keys"
   | "post-data-sensitive-keys"
+  | "response-content-sensitive-keys"
   | "security-headers";
+
+export type HarSensitiveKeyMatch = "contains" | "exact";
 
 export type HarRedactionOptions = {
   rules?: HarRedactionRule[];
   placeholder?: string;
   sensitiveKeys?: string[];
+  sensitiveKeyMatch?: HarSensitiveKeyMatch;
   maxRedactions?: number;
   keepOriginalUrl?: boolean;
 };
@@ -34,6 +38,7 @@ export type HarRedactionChange = {
 export type HarRedactionSummary = {
   entries: number;
   changes: number;
+  changedEntries: number;
   changedRequests: number;
   byRule: Record<HarRedactionRule, number>;
 };
@@ -64,6 +69,7 @@ export const harRedactionRules = [
   "cookies",
   "query-sensitive-keys",
   "post-data-sensitive-keys",
+  "response-content-sensitive-keys",
   "security-headers"
 ] as const satisfies readonly HarRedactionRule[];
 
@@ -90,6 +96,7 @@ const defaultOptions = {
   rules: [...harRedactionRules],
   placeholder: "[REDACTED]",
   sensitiveKeys: [...defaultHarSensitiveKeys],
+  sensitiveKeyMatch: "contains",
   maxRedactions: Number.POSITIVE_INFINITY,
   keepOriginalUrl: false
 } satisfies Required<HarRedactionOptions>;
@@ -143,6 +150,10 @@ export function summarizeHarRedactions(changes: HarRedactionChange[]): Record<Ha
   return summarize(0, changes, new Set()).byRule;
 }
 
+export function isHarRedactionRule(rule: string): rule is HarRedactionRule {
+  return ruleSet.has(rule as HarRedactionRule);
+}
+
 export function createHarRedactor(defaultRedactionOptions: HarRedactionOptions = {}) {
   return {
     redact(input: unknown, options: HarRedactionOptions = {}) {
@@ -175,6 +186,7 @@ function redactRequest(
 function redactResponse(response: MutableRecord, entryIndex: number, context: RedactionContext) {
   redactNamedValues(response.headers, `log.entries[${entryIndex}].response.headers`, entryIndex, context);
   redactNamedValues(response.cookies, `log.entries[${entryIndex}].response.cookies`, entryIndex, context);
+  redactResponseContent(response.content, `log.entries[${entryIndex}].response.content`, entryIndex, context);
 }
 
 function redactNamedValues(
@@ -208,7 +220,7 @@ function redactNamedValues(
     } else if (
       context.settings.enabledRules.has("query-sensitive-keys") &&
       isSensitiveNameValuePath(basePath) &&
-      isSensitiveKey(name, context.settings.sensitiveKeys)
+      isSensitiveKey(name, context.settings.sensitiveKeys, context.settings.sensitiveKeyMatch)
     ) {
       redactValue(item, "query-sensitive-keys", valuePath, entryIndex, `Sensitive query key ${name}`, context);
     }
@@ -228,31 +240,65 @@ function redactPostData(postData: unknown, basePath: string, entryIndex: number,
     });
   }
 
-  if (typeof postData.text !== "string") return;
-  const mimeType = typeof postData.mimeType === "string" ? postData.mimeType.toLowerCase() : "";
+  redactTextBody(postData, `${basePath}.text`, entryIndex, "post-data-sensitive-keys", context, {
+    allowFormEncoded: true,
+    jsonReason: "Sensitive JSON postData key"
+  });
+}
 
-  if (mimeType.includes("x-www-form-urlencoded") || mimeType.includes("form-urlencoded")) {
-    const redactedForm = redactFormEncodedText(postData.text, `${basePath}.text`, entryIndex, context);
-    if (redactedForm !== postData.text) postData.text = redactedForm;
+function redactResponseContent(content: unknown, basePath: string, entryIndex: number, context: RedactionContext) {
+  if (!isRecord(content) || !context.settings.enabledRules.has("response-content-sensitive-keys")) return;
+  redactTextBody(content, `${basePath}.text`, entryIndex, "response-content-sensitive-keys", context, {
+    allowFormEncoded: false,
+    jsonReason: "Sensitive JSON response content key"
+  });
+}
+
+function redactTextBody(
+  container: MutableRecord,
+  textPath: string,
+  entryIndex: number,
+  rule: Extract<HarRedactionRule, "post-data-sensitive-keys" | "response-content-sensitive-keys">,
+  context: RedactionContext,
+  options: {
+    allowFormEncoded: boolean;
+    jsonReason: string;
+  }
+) {
+  if (typeof container.text !== "string") return;
+  if (typeof container.encoding === "string" && container.encoding.toLowerCase() === "base64") return;
+
+  const mimeType = typeof container.mimeType === "string" ? container.mimeType.toLowerCase() : "";
+
+  if (options.allowFormEncoded && (mimeType.includes("x-www-form-urlencoded") || mimeType.includes("form-urlencoded"))) {
+    const redactedForm = redactFormEncodedText(container.text, textPath, entryIndex, context);
+    if (redactedForm !== container.text) container.text = redactedForm;
     return;
   }
 
-  if (!mimeType.includes("json") && !looksLikeJson(postData.text)) return;
+  if (!mimeType.includes("json") && !looksLikeJson(container.text)) return;
 
   try {
-    const parsed = JSON.parse(postData.text) as unknown;
-    const redacted = redactJsonValue(parsed, `${basePath}.text`, entryIndex, context);
-    if (redacted.changed) postData.text = JSON.stringify(redacted.value);
+    const parsed = JSON.parse(container.text) as unknown;
+    const redacted = redactJsonValue(parsed, textPath, entryIndex, context, rule, options.jsonReason);
+    if (redacted.changed) container.text = JSON.stringify(redacted.value);
   } catch {
     return;
   }
 }
 
-function redactJsonValue(value: unknown, path: string, entryIndex: number, context: RedactionContext): { value: unknown; changed: boolean } {
+function redactJsonValue(
+  value: unknown,
+  path: string,
+  entryIndex: number,
+  context: RedactionContext,
+  rule: Extract<HarRedactionRule, "post-data-sensitive-keys" | "response-content-sensitive-keys">,
+  reason: string
+): { value: unknown; changed: boolean } {
   if (Array.isArray(value)) {
     let changed = false;
     const next = value.map((item, index) => {
-      const result = redactJsonValue(item, `${path}[${index}]`, entryIndex, context);
+      const result = redactJsonValue(item, `${path}[${index}]`, entryIndex, context, rule, reason);
       changed ||= result.changed;
       return result.value;
     });
@@ -265,11 +311,11 @@ function redactJsonValue(value: unknown, path: string, entryIndex: number, conte
   const next: MutableRecord = {};
   for (const [key, child] of Object.entries(value)) {
     const childPath = `${path}.${escapePathSegment(key)}`;
-    if (isSensitiveKey(key, context.settings.sensitiveKeys)) {
+    if (isSensitiveKey(key, context.settings.sensitiveKeys, context.settings.sensitiveKeyMatch)) {
       const didRecord = recordChange(
         childPath,
-        "post-data-sensitive-keys",
-        "Sensitive JSON postData key",
+        rule,
+        reason,
         valueForLength(child),
         context.settings.placeholder,
         entryIndex,
@@ -278,7 +324,7 @@ function redactJsonValue(value: unknown, path: string, entryIndex: number, conte
       next[key] = didRecord ? context.settings.placeholder : child;
       changed ||= didRecord;
     } else {
-      const result = redactJsonValue(child, childPath, entryIndex, context);
+      const result = redactJsonValue(child, childPath, entryIndex, context, rule, reason);
       next[key] = result.value;
       changed ||= result.changed;
     }
@@ -297,7 +343,7 @@ function redactFormEncodedText(text: string, path: string, entryIndex: number, c
 
   let changed = false;
   for (const key of [...params.keys()]) {
-    if (!isSensitiveKey(key, context.settings.sensitiveKeys)) continue;
+    if (!isSensitiveKey(key, context.settings.sensitiveKeys, context.settings.sensitiveKeyMatch)) continue;
     for (const value of params.getAll(key)) {
       const didRecord = recordChange(
         `${path}.formParams.${escapePathSegment(key)}`,
@@ -329,7 +375,7 @@ function redactUrl(url: string, entryIndex: number, context: RedactionContext) {
 
   let changed = false;
   for (const key of [...parsed.searchParams.keys()]) {
-    if (!isSensitiveKey(key, context.settings.sensitiveKeys)) continue;
+    if (!isSensitiveKey(key, context.settings.sensitiveKeys, context.settings.sensitiveKeyMatch)) continue;
     for (const value of parsed.searchParams.getAll(key)) {
       const didRecord = recordChange(
         `log.entries[${entryIndex}].request.url.searchParams.${escapePathSegment(key)}`,
@@ -405,6 +451,7 @@ function summarize(entries: number, changes: HarRedactionChange[], changedEntryI
   return {
     entries,
     changes: changes.length,
+    changedEntries: changedEntryIndexes.size,
     changedRequests: changedEntryIndexes.size,
     byRule
   };
@@ -449,6 +496,7 @@ function normalizeOptions(options: HarRedactionOptions): NormalizedOptions {
     rules,
     placeholder: options.placeholder ?? defaultOptions.placeholder,
     sensitiveKeys: options.sensitiveKeys ?? defaultOptions.sensitiveKeys,
+    sensitiveKeyMatch: options.sensitiveKeyMatch ?? defaultOptions.sensitiveKeyMatch,
     maxRedactions: options.maxRedactions ?? defaultOptions.maxRedactions,
     keepOriginalUrl: options.keepOriginalUrl ?? defaultOptions.keepOriginalUrl,
     enabledRules: new Set(rules),
@@ -456,9 +504,14 @@ function normalizeOptions(options: HarRedactionOptions): NormalizedOptions {
   };
 }
 
-function isSensitiveKey(key: string, sensitiveKeys: string[]) {
+function isSensitiveKey(key: string, sensitiveKeys: string[], matchMode: HarSensitiveKeyMatch) {
   const normalized = key.toLowerCase().replace(/[-_\s.]/g, "");
-  return sensitiveKeys.some((sensitiveKey) => normalized.includes(sensitiveKey.toLowerCase().replace(/[-_\s.]/g, "")));
+  return sensitiveKeys.some((sensitiveKey) => {
+    const normalizedSensitiveKey = sensitiveKey.toLowerCase().replace(/[-_\s.]/g, "");
+    return matchMode === "exact"
+      ? normalized === normalizedSensitiveKey
+      : normalized.includes(normalizedSensitiveKey);
+  });
 }
 
 function isRecord(value: unknown): value is MutableRecord {
