@@ -2,6 +2,8 @@ export type HarRedactionDiagnostic =
   | "invalid-input"
   | "invalid-json"
   | "invalid-har-shape"
+  | "invalid-options"
+  | "unserializable-input"
   | "unknown-rule"
   | "entry-without-request"
   | "entry-without-response"
@@ -113,7 +115,12 @@ export function redactHar(
     return failure(source.diagnostic);
   }
 
-  const har = cloneJson(source.value);
+  const cloned = cloneJson(source.value);
+  if (!cloned.ok) {
+    return failure("unserializable-input");
+  }
+
+  const har = cloned.value;
   if (!isRecord(har) || !isRecord(har.log) || !Array.isArray(har.log.entries)) {
     return failure("invalid-har-shape");
   }
@@ -344,7 +351,13 @@ function redactFormEncodedText(text: string, path: string, entryIndex: number, c
   let changed = false;
   for (const key of [...params.keys()]) {
     if (!isSensitiveKey(key, context.settings.sensitiveKeys, context.settings.sensitiveKeyMatch)) continue;
-    for (const value of params.getAll(key)) {
+
+    const values = params.getAll(key);
+    if (!hasRedactionCapacity(values.length, context)) {
+      return changed ? params.toString() : text;
+    }
+
+    for (const value of values) {
       const didRecord = recordChange(
         `${path}.formParams.${escapePathSegment(key)}`,
         "post-data-sensitive-keys",
@@ -376,7 +389,13 @@ function redactUrl(url: string, entryIndex: number, context: RedactionContext) {
   let changed = false;
   for (const key of [...parsed.searchParams.keys()]) {
     if (!isSensitiveKey(key, context.settings.sensitiveKeys, context.settings.sensitiveKeyMatch)) continue;
-    for (const value of parsed.searchParams.getAll(key)) {
+
+    const values = parsed.searchParams.getAll(key);
+    if (!hasRedactionCapacity(values.length, context)) {
+      return changed ? parsed.toString() : url;
+    }
+
+    for (const value of values) {
       const didRecord = recordChange(
         `log.entries[${entryIndex}].request.url.searchParams.${escapePathSegment(key)}`,
         "query-sensitive-keys",
@@ -416,7 +435,19 @@ function isSensitiveNameValuePath(path: string) {
 }
 
 function valueForLength(value: unknown) {
-  return typeof value === "string" ? value : JSON.stringify(value);
+  if (typeof value === "string") return value;
+
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function hasRedactionCapacity(count: number, context: RedactionContext) {
+  if (context.changes.length + count <= context.settings.maxRedactions) return true;
+  context.diagnostics.push("redaction-limit-reached");
+  return false;
 }
 
 function recordChange(
@@ -483,43 +514,111 @@ type RedactionContext = {
   diagnostics: HarRedactionDiagnostic[];
 };
 
-function normalizeOptions(options: HarRedactionOptions): NormalizedOptions {
+function normalizeOptions(optionsInput: HarRedactionOptions): NormalizedOptions {
   const diagnostics: HarRedactionDiagnostic[] = [];
-  const requestedRules = options.rules ?? defaultOptions.rules;
+  const options = isRecord(optionsInput) ? optionsInput : {};
+  if (options !== optionsInput) diagnostics.push("invalid-options");
+
+  const requestedRules = Array.isArray(options.rules)
+    ? options.rules
+    : options.rules === undefined
+      ? defaultOptions.rules
+      : markInvalidOption(defaultOptions.rules, diagnostics);
   const rules = requestedRules.filter((rule) => {
-    const known = ruleSet.has(rule);
+    const known = typeof rule === "string" && ruleSet.has(rule as HarRedactionRule);
     if (!known) diagnostics.push("unknown-rule");
     return known;
-  });
+  }) as HarRedactionRule[];
+  const sensitiveKeys = normalizeSensitiveKeys(options.sensitiveKeys, diagnostics);
 
   return {
     rules,
-    placeholder: options.placeholder ?? defaultOptions.placeholder,
-    sensitiveKeys: options.sensitiveKeys ?? defaultOptions.sensitiveKeys,
-    sensitiveKeyMatch: options.sensitiveKeyMatch ?? defaultOptions.sensitiveKeyMatch,
-    maxRedactions: options.maxRedactions ?? defaultOptions.maxRedactions,
-    keepOriginalUrl: options.keepOriginalUrl ?? defaultOptions.keepOriginalUrl,
+    placeholder: normalizeStringOption(options.placeholder, defaultOptions.placeholder, diagnostics),
+    sensitiveKeys,
+    sensitiveKeyMatch: normalizeSensitiveKeyMatch(options.sensitiveKeyMatch, diagnostics),
+    maxRedactions: normalizeMaxRedactions(options.maxRedactions, diagnostics),
+    keepOriginalUrl: normalizeBooleanOption(options.keepOriginalUrl, defaultOptions.keepOriginalUrl, diagnostics),
     enabledRules: new Set(rules),
     diagnostics
   };
 }
 
+function markInvalidOption<T>(fallback: T, diagnostics: HarRedactionDiagnostic[]): T {
+  diagnostics.push("invalid-options");
+  return fallback;
+}
+
+function normalizeStringOption(value: unknown, fallback: string, diagnostics: HarRedactionDiagnostic[]) {
+  if (value === undefined) return fallback;
+  if (typeof value === "string") return value;
+  diagnostics.push("invalid-options");
+  return fallback;
+}
+
+function normalizeBooleanOption(value: unknown, fallback: boolean, diagnostics: HarRedactionDiagnostic[]) {
+  if (value === undefined) return fallback;
+  if (typeof value === "boolean") return value;
+  diagnostics.push("invalid-options");
+  return fallback;
+}
+
+function normalizeSensitiveKeys(value: unknown, diagnostics: HarRedactionDiagnostic[]) {
+  if (value === undefined) return defaultOptions.sensitiveKeys;
+  if (!Array.isArray(value)) {
+    diagnostics.push("invalid-options");
+    return defaultOptions.sensitiveKeys;
+  }
+
+  const keys = value.filter((item): item is string => {
+    const valid = typeof item === "string" && normalizeSensitiveKey(item).length > 0;
+    if (!valid) diagnostics.push("invalid-options");
+    return valid;
+  });
+
+  return keys;
+}
+
+function normalizeSensitiveKeyMatch(value: unknown, diagnostics: HarRedactionDiagnostic[]): HarSensitiveKeyMatch {
+  if (value === undefined) return defaultOptions.sensitiveKeyMatch;
+  if (value === "contains" || value === "exact") return value;
+  diagnostics.push("invalid-options");
+  return defaultOptions.sensitiveKeyMatch;
+}
+
+function normalizeMaxRedactions(value: unknown, diagnostics: HarRedactionDiagnostic[]) {
+  if (value === undefined) return defaultOptions.maxRedactions;
+  if (value === Number.POSITIVE_INFINITY) return value;
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return Math.floor(value);
+  diagnostics.push("invalid-options");
+  return defaultOptions.maxRedactions;
+}
+
 function isSensitiveKey(key: string, sensitiveKeys: string[], matchMode: HarSensitiveKeyMatch) {
-  const normalized = key.toLowerCase().replace(/[-_\s.]/g, "");
+  const normalized = normalizeSensitiveKey(key);
   return sensitiveKeys.some((sensitiveKey) => {
-    const normalizedSensitiveKey = sensitiveKey.toLowerCase().replace(/[-_\s.]/g, "");
+    const normalizedSensitiveKey = normalizeSensitiveKey(sensitiveKey);
     return matchMode === "exact"
       ? normalized === normalizedSensitiveKey
       : normalized.includes(normalizedSensitiveKey);
   });
 }
 
+function normalizeSensitiveKey(key: string) {
+  return key.toLowerCase().replace(/[-_\s.]/g, "");
+}
+
 function isRecord(value: unknown): value is MutableRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function cloneJson<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
+function cloneJson<T>(value: T): { ok: true; value: T } | { ok: false } {
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) return { ok: false };
+    return { ok: true, value: JSON.parse(serialized) as T };
+  } catch {
+    return { ok: false };
+  }
 }
 
 function looksLikeJson(value: string) {

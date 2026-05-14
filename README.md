@@ -86,7 +86,7 @@ type HarRedactionResult =
     };
 ```
 
-Expected invalid input returns `{ ok: false }` instead of throwing.
+Expected invalid input returns `{ ok: false }` instead of throwing. Object inputs must be JSON-serializable, which matches the HAR format and avoids mutating circular or non-JSON data.
 
 `summary.changedEntries` counts HAR entries where at least one request or response value changed. `summary.changedRequests` is kept as a compatibility alias with the same value.
 
@@ -159,6 +159,8 @@ Exports the default key names used by query, form and JSON redaction.
 | `maxRedactions` | unlimited | Stop changing values after this count. |
 | `keepOriginalUrl` | `false` | Keep `request.url` unchanged while still redacting `queryString`. |
 
+Invalid runtime options are ignored with an `invalid-options` diagnostic instead of throwing. Empty sensitive key names are ignored so they cannot match every key accidentally.
+
 For strict tooling, use exact key matching to avoid broad matches such as `key` matching `monkey`:
 
 ```ts
@@ -196,6 +198,8 @@ Diagnostics are stable strings intended for logs, UI hints and tests:
 - `invalid-input`
 - `invalid-json`
 - `invalid-har-shape`
+- `invalid-options`
+- `unserializable-input`
 - `unknown-rule`
 - `entry-without-request`
 - `entry-without-response`
@@ -217,6 +221,7 @@ Use conservative defaults, review the `changes` report, and add project-specific
 - render a HAR waterfall;
 - inspect every vendor-specific HAR extension;
 - decode and rewrite base64-encoded response bodies;
+- mutate circular, BigInt-containing or otherwise non-JSON-serializable object input;
 - guarantee that all secrets are removed.
 
 The core is designed for browser workbenches, support tools and thin CLIs.

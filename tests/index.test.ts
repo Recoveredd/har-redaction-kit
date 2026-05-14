@@ -86,6 +86,17 @@ describe("redactHar", () => {
     expect(redactHar({ log: {} })).toMatchObject({ ok: false, diagnostics: ["invalid-har-shape"] });
   });
 
+  it("does not throw on unserializable object input", () => {
+    const circular: { log: { entries: [] }; self?: unknown } = { log: { entries: [] } };
+    circular.self = circular;
+
+    expect(redactHar(circular)).toMatchObject({ ok: false, diagnostics: ["unserializable-input"] });
+    expect(redactHar({ log: { entries: [] }, value: BigInt(1) })).toMatchObject({
+      ok: false,
+      diagnostics: ["unserializable-input"]
+    });
+  });
+
   it("keeps original URLs when requested and allows custom placeholders", () => {
     const result = redactHar(sampleHar, {
       keepOriginalUrl: true,
@@ -281,6 +292,22 @@ describe("redactHar", () => {
     expect(result.summary.changes).toBe(1);
   });
 
+  it("normalizes invalid runtime options without throwing", () => {
+    const result = redactHar(sampleHar, {
+      keepOriginalUrl: "yes",
+      maxRedactions: -1,
+      placeholder: 42,
+      rules: "authorization-headers",
+      sensitiveKeyMatch: "prefix",
+      sensitiveKeys: ["token", "", 123]
+    } as never);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected success");
+    expect(result.diagnostics).toContain("invalid-options");
+    expect(result.summary.changes).toBeGreaterThan(0);
+  });
+
   it("stops redacting once the max redaction limit is reached", () => {
     const result = redactHar(sampleHar, {
       maxRedactions: 2
@@ -291,6 +318,35 @@ describe("redactHar", () => {
     expect(result.diagnostics).toContain("redaction-limit-reached");
     expect(result.summary.changes).toBe(2);
     expect(result.summary.changedEntries).toBe(1);
+  });
+
+  it("keeps URL redaction reports consistent when the limit is too small for repeated params", () => {
+    const result = redactHar(
+      {
+        log: {
+          entries: [
+            {
+              request: {
+                method: "GET",
+                url: "https://example.test/?token=a&token=b",
+                headers: []
+              }
+            }
+          ]
+        }
+      },
+      {
+        maxRedactions: 1,
+        rules: ["query-sensitive-keys"]
+      }
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected success");
+    const har = result.har as { log: { entries: Array<{ request: { url: string } }> } };
+    expect(har.log.entries[0]!.request.url).toBe("https://example.test/?token=a&token=b");
+    expect(result.summary.changes).toBe(0);
+    expect(result.diagnostics).toContain("redaction-limit-reached");
   });
 
   it("can use exact sensitive key matching for stricter integrations", () => {
