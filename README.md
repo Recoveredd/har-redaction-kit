@@ -1,5 +1,6 @@
 # har-redaction-kit
 
+[![npm version](https://img.shields.io/npm/v/har-redaction-kit.svg)](https://www.npmjs.com/package/har-redaction-kit)
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
 [![CI](https://github.com/Recoveredd/har-redaction-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/Recoveredd/har-redaction-kit/actions/workflows/ci.yml)
 
@@ -7,7 +8,7 @@ Redact sensitive fields from HAR files with deterministic reports.
 
 `har-redaction-kit` is a small TypeScript package for local-first HAR cleanup workflows. It accepts a parsed HAR object or a HAR JSON string, returns a cloned sanitized HAR, and lists every changed path without copying secret values into the report.
 
-Links: [Demo](https://packages.wasta-wocket.fr/har-redaction-kit/) · [GitHub](https://github.com/Recoveredd/har-redaction-kit)
+Links: [Demo](https://packages.wasta-wocket.fr/har-redaction-kit/) · [npm](https://www.npmjs.com/package/har-redaction-kit) · [GitHub](https://github.com/Recoveredd/har-redaction-kit)
 
 ## Package quality
 
@@ -18,11 +19,8 @@ Links: [Demo](https://packages.wasta-wocket.fr/har-redaction-kit/) · [GitHub](h
 - CI runs `npm ci`, `typecheck`, `build`, and `test`.
 - Tested on Node.js 20 and 22 with GitHub Actions.
 
-## Publication status
 
-This package is currently a GitHub preview and is queued for npm publication. The browser demo is available now, and the install command below is the command to use once the npm package is published.
-
-## Install after npm publication
+## Install
 
 ```bash
 npm install har-redaction-kit
